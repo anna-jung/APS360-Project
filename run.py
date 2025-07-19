@@ -24,6 +24,25 @@ import os
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+# Define MLP for TTT
+class TTTMLP(torch.nn.Module):
+    def __init__(self, dim):
+        super(TTTMLP, self).__init__()
+        self.mlp = torch.nn.Sequential(
+            torch.nn.Linear(dim, dim * 4),
+            torch.nn.GELU(),
+            torch.nn.Linear(dim * 4, dim),
+        )
+        self.norm = torch.nn.LayerNorm(dim)
+
+    def forward(self, x):
+        return x + self.norm(self.mlp(x))
+    
+def ttt_prime(ttt, x, dim=1):
+    x_rev = torch.flip(x, dims=[dim])
+    ttt_rev = ttt(x_rev)
+    return torch.flip(ttt_rev, dims=[dim])
+
 # Download model
 model, model_config = get_pretrained_model("HKUSTAudio/AudioX")
 sample_rate = model_config["sample_rate"]
