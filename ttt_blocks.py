@@ -59,4 +59,17 @@ class TTTModule(torch.nn.Module):
         z = self.gating_a(x_, self.ttt_mlp(x_))
         z_ = self.gating_b(z, ttt_prime(self.ttt_mlp, z))
         return x + z_
+
+
+class TTT(torch.nn.Module):
+    def __init__(self, num_layers, dim):
+        self.layers = torch.nn.ModuleList([
+            TTTModule(dim) for _ in range(num_layers)    
+        ])
     
+    def forward(self, index, x, x_):
+        return self.layers[index](x, x_)
+
+# you can use this like this
+# my_ttt_module = TTT(len(transformer.layers), transformer.dim)
+# out = transformer(x, ..., ttt_module = my_ttt_module)
