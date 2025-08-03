@@ -173,3 +173,6 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 model/
+
+LSTMBaseline.py
+/processed_fsd50k

@@ -40,3 +40,23 @@ class ttt_self_supervised_module(nn.Module):
         out = self.ttt_module(x_k)
         loss = F.mse_loss(out, x_v)
         return loss
+
+class Gating(torch.nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.alpha = torch.nn.Parameter(0.1 * torch.ones(dim)) 
+    
+    def forward(self, x, z):
+        return x + torch.tanh(self.alpha) * z
+
+class TTTModule(torch.nn.Module):
+    def __init__(self, dim):
+        self.gating_a = Gating(dim)
+        self.gating_b = Gating(dim)
+        self.ttt_mlp = TTTMLP(dim)
+
+    def forward(self, x, x_):
+        z = self.gating_a(x_, self.ttt_mlp(x_))
+        z_ = self.gating_b(z, ttt_prime(self.ttt_mlp, z))
+        return x + z_
+    
