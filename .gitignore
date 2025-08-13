@@ -175,4 +175,5 @@ cython_debug/
 model/
 
 LSTMBaseline.py
-/processed_fsd50k
+/processed_fsd50k*
+/tmpfh5ruq9i
