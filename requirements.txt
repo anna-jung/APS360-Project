@@ -30,3 +30,5 @@ vector-quantize-pytorch==1.9.14
 wandb
 webdataset==0.2.48
 x-transformers<1.27.0
+accelerate>=0.29.0
+matplotlib

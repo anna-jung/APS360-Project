@@ -21,12 +21,17 @@ class AudioDataset(Dataset):
     def __getitem__(self, idx):
         item = self.dataset[idx]
         waveform = torch.tensor(item['audio_noisy']).unsqueeze(0)  # [1, T]
+        # Pad or truncate to self.audio_len (should be 30s)
         if self.audio_len > 0:
-            waveform = waveform[:, :self.audio_len]
+            if waveform.shape[1] < self.audio_len:
+                pad_len = self.audio_len - waveform.shape[1]
+                waveform = torch.nn.functional.pad(waveform, (0, pad_len))
+            else:
+                waveform = waveform[:, :self.audio_len]
         label = item.get('text', -1)
         return waveform, label
 
-PROCESSED_DATA_DIR = "./processed_fsd50k"
+PROCESSED_DATA_DIR = "./processed_fsd50k_captioned_conette"
 TARGET_DURATION = 25.0  # seconds
 SAMPLE_RATE = 16000
 TARGET_LENGTH = int(TARGET_DURATION * SAMPLE_RATE)
@@ -180,7 +185,7 @@ class TTT_RecaptionedDataset(Dataset):
 
 if __name__ == "__main__":
     # Test for TTT_NaiveCaptionedDataset
-    ttt_train_dataset = TTT_NaiveCaptionedDataset(dataset['train'], sample_rate=SAMPLE_RATE)
+    ttt_train_dataset = TTT_RecaptionedDataset(dataset['train'], sample_rate=SAMPLE_RATE)
     print("First 3 items in TTT_NaiveCaptionedDataset (train):")
     for i in range(3):
         waveforms, labels = ttt_train_dataset[i]
