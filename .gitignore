@@ -177,3 +177,8 @@ model/
 LSTMBaseline.py
 /processed_fsd50k*
 /tmpfh5ruq9i
+
+/checkpoints
+/lightning_logs
+
+*.wav

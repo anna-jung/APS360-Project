@@ -1,10 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from stable_audio_tools import get_pretrained_model
-from stable_audio_tools.inference.generation import generate_diffusion_cond
-from stable_audio_tools.data.utils import read_video, merge_video_audio
-from stable_audio_tools.data.utils import load_and_process_audio
 
 # Define MLP for TTT
 class TTTMLP(torch.nn.Module):
@@ -16,9 +12,13 @@ class TTTMLP(torch.nn.Module):
             torch.nn.Linear(dim * 4, dim),
         )
         self.norm = torch.nn.LayerNorm(dim)
-
+        
     def forward(self, x):
-        return x + self.norm(self.mlp(x))
+        dtype = x.dtype
+        y = self.mlp(x.to(torch.float32))
+        y = self.norm(y)
+        y = y.to(dtype)
+        return x + y
     
 def ttt_prime(ttt, x, dim=1):
     x_rev = torch.flip(x, dims=[dim])
@@ -51,6 +51,7 @@ class Gating(torch.nn.Module):
 
 class TTTModule(torch.nn.Module):
     def __init__(self, dim):
+        super().__init__()
         self.gating_a = Gating(dim)
         self.gating_b = Gating(dim)
         self.ttt_mlp = TTTMLP(dim)
@@ -63,12 +64,31 @@ class TTTModule(torch.nn.Module):
 
 class TTT(torch.nn.Module):
     def __init__(self, num_layers, dim):
+        super().__init__()
         self.layers = torch.nn.ModuleList([
-            TTTModule(dim) for _ in range(num_layers)    
+            TTTModule(dim) for _ in range(num_layers)
         ])
     
     def forward(self, index, x, x_):
         return self.layers[index](x, x_)
+
+    def self_supervised_forward(self, xk, xv, use_ttt_prime=True):
+        total_loss = 0
+        # The loss is applied to each TTTMLP module within the TTT layers
+        for layer in self.layers:
+            ttt_mlp = layer.ttt_mlp
+            if use_ttt_prime:
+                # Time-reversal task
+                xk_rev = torch.flip(xk, dims=[1])
+                out = ttt_mlp(xk_rev)
+                out = torch.flip(out, dims=[1])
+                loss = F.mse_loss(out, xv)
+            else:
+                # Simple prediction task
+                out = ttt_mlp(xk)
+                loss = F.mse_loss(out, xv)
+            total_loss += loss
+        return total_loss / len(self.layers) if self.layers else 0.0
 
 # you can use this like this
 # my_ttt_module = TTT(len(transformer.layers), transformer.dim)

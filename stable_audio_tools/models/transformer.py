@@ -799,10 +799,12 @@ class ContinuousTransformer(nn.Module):
 
         # Iterate over the transformer layers
         for index, layer in enumerate(self.layers):
-            old_x = x # cache the original X before attention
-            x = checkpoint(layer, x, rotary_pos_emb = rotary_pos_emb, global_cond=global_cond, **kwargs)
-
-            if ttt_module := kwargs.get('ttt_module') is not None:
+            old_x = x.clone()  # cache the original X before attention
+            # Keep ttt_module but do not pass it into the layer call
+            ttt_module = kwargs.get('ttt_module', None)
+            layer_kwargs = {k: v for k, v in kwargs.items() if k != 'ttt_module'}
+            x = checkpoint(layer, x, rotary_pos_emb=rotary_pos_emb, global_cond=global_cond, **layer_kwargs)
+            if ttt_module is not None:
                 x = ttt_module(index, old_x, x)
 
             if return_info:
