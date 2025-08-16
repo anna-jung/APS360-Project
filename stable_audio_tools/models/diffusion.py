@@ -10,7 +10,6 @@ from .conditioners import MultiConditioner, create_multi_conditioner_from_condit
 from .dit import DiffusionTransformer
 from .factory import create_pretransform_from_config
 from .pretransforms import Pretransform
-from ..inference.generation import generate_diffusion_cond
 
 from .adp import UNetCFG1d, UNet1d
 
@@ -212,6 +211,8 @@ class ConditionedDiffusionModelWrapper(nn.Module):
         return self.model(x, t, **self.get_conditioning_inputs(cond), **kwargs)
 
     def generate(self, *args, **kwargs):
+        # Lazy import to avoid heavy deps during training-only usage
+        from ..inference.generation import generate_diffusion_cond
         return generate_diffusion_cond(self, *args, **kwargs)
 
 class UNetCFG1DWrapper(ConditionedDiffusionModel):

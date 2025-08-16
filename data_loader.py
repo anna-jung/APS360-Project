@@ -5,15 +5,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import torchaudio
+import torchaudio.functional as F_audio
 import torchaudio.transforms as transforms
 from datasets import load_dataset, Audio
 from torch.utils.data import Dataset, DataLoader
 import os
 
+PROCESSED_DATA_DIR = "./processed_fsd50k_captioned_conette"
+TARGET_DURATION = 25.0  # seconds
+SAMPLE_RATE = 16000
+TARGET_LENGTH = int(TARGET_DURATION * SAMPLE_RATE)
+
 class AudioDataset(Dataset):
-    def __init__(self, hf_dataset, audio_len=-1):
+    def __init__(self, hf_dataset, audio_len=-1, sample_rate=SAMPLE_RATE):
         self.dataset = hf_dataset
         self.audio_len = audio_len
+        self.sample_rate = sample_rate
 
     def __len__(self):
         return len(self.dataset)
@@ -21,6 +28,12 @@ class AudioDataset(Dataset):
     def __getitem__(self, idx):
         item = self.dataset[idx]
         waveform = torch.tensor(item['audio_noisy']).unsqueeze(0)  # [1, T]
+        
+        # Resample if sample rate doesn't match the target SAMPLE_RATE
+        audio_sample_rate = item['audio'].get('sampling_rate', self.sample_rate)
+        if audio_sample_rate != self.sample_rate:
+            waveform = F_audio.resample(waveform, orig_freq=audio_sample_rate, new_freq=self.sample_rate)
+        
         # Pad or truncate to self.audio_len (should be 30s)
         if self.audio_len > 0:
             if waveform.shape[1] < self.audio_len:
@@ -115,6 +128,12 @@ class TTT_NaiveCaptionedDataset(Dataset):
         waveform = torch.tensor(item['audio_noisy'])
         if waveform.dim() == 1:
             waveform = waveform.unsqueeze(0)  # [1, T]
+        
+        # Resample if sample rate doesn't match the global SAMPLE_RATE
+        audio_sample_rate = item['audio'].get('sampling_rate', self.sample_rate)
+        if audio_sample_rate != self.sample_rate:
+            waveform = F_audio.resample(waveform, orig_freq=audio_sample_rate, new_freq=self.sample_rate)
+        
         # Pad to at least 30s
         length = waveform.shape[1]
         if length < self.min_length:
@@ -157,6 +176,11 @@ class TTT_RecaptionedDataset(Dataset):
         waveform = torch.tensor(item['audio_noisy'])
         if waveform.dim() == 1:
             waveform = waveform.unsqueeze(0)  # [1, T]
+        
+        # Resample if sample rate doesn't match the global SAMPLE_RATE
+        if SAMPLE_RATE != self.sample_rate:
+            waveform = F_audio.resample(waveform, orig_freq=SAMPLE_RATE, new_freq=self.sample_rate)
+
         # Pad/truncate to 30s
         if waveform.shape[1] < self.min_length:
             pad_len = self.min_length - waveform.shape[1]

@@ -1,7 +1,18 @@
 import os
 import math
 import argparse
-from dataclasses import dataclass
+from typing import List, Dict, Any, Tuple
+import csv
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import torchaudio
+
+from accelerate import Accelerator
+from accelerate.utils import set_seed
+import argparse
 from typing import List, Dict, Any, Tuple
 
 import torch
@@ -10,7 +21,8 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import torchaudio
 
-import pytorch_lightning as pl
+from accelerate import Accelerator
+from accelerate.utils import set_seed
 
 from data_loader import TTT_RecaptionedDataset, SAMPLE_RATE as DS_SR
 from datasets import load_dataset
@@ -21,289 +33,49 @@ from stable_audio_tools.inference.utils import set_audio_channels
 
 from ttt_blocks import TTT
 
+# Global training state
+train_hist = {"step": [], "loss": []}
+kdenoiser = None
 
-def _pad_trunc(audio: torch.Tensor, target_len: int) -> torch.Tensor:
-    """Pad or truncate last dimension to target_len."""
-    n = audio.shape[-1]
-    if n == target_len:
-        return audio
-    if n < target_len:
-        pad = target_len - n
-        return F.pad(audio, (0, pad))
-    return audio[..., :target_len]
+# Training config
+p_mean = 2.5
+p_std = 1.2
+sigma_min = 0.3
+sigma_max = 500.0
+cfg_dropout_prob = 0.1
 
 
-class TTTRecapTrain(Dataset):
-    """Flattened wrapper over TTT_RecaptionedDataset: returns individual 10s segments.
-
-    Output:
-      - audio: Tensor [C, T]
-      - meta: dict with keys: text_prompt (str), video_prompt (Tensor or None), audio_prompt (Tensor or None)
+def collate_batch_ttt(batch):
     """
-    def __init__(self, hf_split, target_sr: int, seconds: float = 10.0):
-        self.base = TTT_RecaptionedDataset(hf_split, sample_rate=DS_SR)
-        self.target_sr = target_sr
-        self.target_len = int(seconds * target_sr)
-
-    def __len__(self):
-        return len(self.base) * 3
-
-    def __getitem__(self, idx: int):
-        item_ix = idx // 3
-        seg_ix = idx % 3
-        waveforms, labels = self.base[item_ix]
-        audio = waveforms[seg_ix]  # [1, T]
-
-        # resample if needed
-        if self.target_sr != DS_SR:
-            audio = torchaudio.functional.resample(audio, orig_freq=DS_SR, new_freq=self.target_sr)
-
-        audio = _pad_trunc(audio, self.target_len)
-
-        meta = {
-            "text_prompt": labels[seg_ix],
-            # placeholders for optional modalities; we’ll stub in the module
-            "video_prompt": None,
-            "audio_prompt": None,
-        }
-        return audio, meta
-
-
-def build_stub_conditioning(batch_meta: List[Dict[str, Any]], cond_dim: int = 768,
-                            video_tokens: int = 1, text_tokens: int = 1, audio_tokens: int = 1,
-                            device: torch.device = torch.device("cpu")) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
-    """Create minimal zero conditioning to avoid heavyweight encoders during smoke tests.
-    Shapes:
-      returns dict[id] -> (tensor [B, T, cond_dim], mask [B, T])
+    Collate function for TTT training.
+    
+    Input: List of (audios_list, metas_list) where each has 3 audio/meta items
+    Output: (batch_audios_list, batch_metas_list) for TTT mini-batch training
     """
-    b = len(batch_meta)
-    zeros = lambda t: torch.zeros((b, t, cond_dim), device=device)
-    ones_mask = lambda t: torch.ones((b, t), dtype=torch.bool, device=device)
+    batch_audios = []
+    batch_metas = []
+    
+    for audios_list, metas_list in batch:
+        batch_audios.extend(audios_list)  # List of 3 audio tensors
+        for label in metas_list:
+            meta = {
+                "text_prompt": label,
+                # default non-None prompts like run.py expects
+                # video_prompt should be a list with a batched tensor
+                "video_prompt": [torch.zeros(1, 50, 3, 224, 224)],
+                # audio_prompt is a batched tensor [B, C, T]
+                "audio_prompt": torch.zeros(1, 2, 441000),
+                # include timing metadata
+                "seconds_start": 0,
+                "seconds_total": 10,
+            }
+            batch_metas.append(meta)
 
-    cond = {
-        "video_prompt": (zeros(video_tokens), ones_mask(video_tokens)),
-        "text_prompt": (zeros(text_tokens), ones_mask(text_tokens)),
-        "audio_prompt": (zeros(audio_tokens), ones_mask(audio_tokens)),
-    }
-    return cond
-
-
-class TTTProjections(nn.Module):
-    """Learned projections Theta_Q, Theta_K, Theta_V for outer-loop training.
-    Returns (q, k, v) with shape [B, T, proj_dim].
-    """
-    def __init__(self, dim: int, proj_dim: int):
-        super().__init__()
-        self.theta_Q = nn.Linear(dim, proj_dim, bias=False)
-        self.theta_K = nn.Linear(dim, proj_dim, bias=False)
-        self.theta_V = nn.Linear(dim, proj_dim, bias=False)
-
-    def forward(self, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.theta_Q(h), self.theta_K(h), self.theta_V(h)
-
-
-class TTTCondTrainingWrapper(pl.LightningModule):
-    """Lightweight training loop mirroring stable_audio_tools DiffusionCondTrainingWrapper,
-    with TTT gating + inner self-supervised loss.
-    """
-    def __init__(self, diffusion_wrapper: nn.Module, ttt: TTT, ttt_proj: TTTProjections,
-                 sample_rate: int, lr: float = 5e-5, ttt_weight: float = 0.1,
-                 use_stub_conditioning: bool = True, cond_dim: int = 768,
-                 cfg_dropout_prob: float = 0.1,
-                 collect_hidden_states: bool = False,
-                 proj_weight: float = 0.05,
-                 p_mean: float = -1.2, p_std: float = 1.0,
-                 sigma_min: float = 0.002, sigma_max: float = 1.0):
-        super().__init__()
-        self.diffusion = diffusion_wrapper
-        self.sample_rate = sample_rate
-        self.lr = lr
-        self.cfg_dropout_prob = cfg_dropout_prob
-
-        self.ttt = ttt
-        self.ttt_proj = ttt_proj
-        self.ttt_weight = ttt_weight
-        self.proj_weight = proj_weight
-
-        # Sobol for timesteps
-        self.rng = torch.quasirandom.SobolEngine(1, scramble=True)
-
-        # logs
-        self.train_hist = {"step": [], "loss": [], "diffusion": [], "ttt": []}
-
-        self.use_stub_conditioning = use_stub_conditioning
-        self.cond_dim = cond_dim
-        self.collect_hidden_states = collect_hidden_states
-        # K-diffusion sigma config (EDM)
-        self.p_mean = p_mean
-        self.p_std = p_std
-        self.sigma_min = sigma_min
-        self.sigma_max = sigma_max
-        self._denoiser = None  # lazy init
-
-        # Freeze everything except TTT layers
-        self.diffusion.requires_grad_(False)
-        for p in self.diffusion.parameters():
-            p.requires_grad = False
-        # Projections are trainable in the outer loop (but frozen inside inner TTT loss by detaching their outputs)
-        self.ttt_proj.requires_grad_(True)
-        for p in self.ttt_proj.parameters():
-            p.requires_grad = True
-        # Respect requires_grad flags set on TTT layers (optionally adjusted in main)
-
-        # Put frozen modules in eval to save memory
-        self.diffusion.eval()
-
-    def configure_optimizers(self):
-        # Optimize TTT parameters and projection parameters
-        params = []
-        params += [p for p in self.ttt.parameters() if p.requires_grad]
-        params += [p for p in self.ttt_proj.parameters() if p.requires_grad]
-        return torch.optim.AdamW(params, lr=self.lr, betas=(0.9, 0.999), weight_decay=1e-3)
-
-    def _conditioning(self, batch_meta: List[Dict[str, Any]]):
-        if self.use_stub_conditioning:
-            return build_stub_conditioning(batch_meta, cond_dim=self.cond_dim, device=self.device)
-        # Fallback: use model’s conditioner (costly). Expect batch_meta as required by MultiConditioner.
-        return self.diffusion.conditioner(batch_meta, self.device)
-
-    def training_step(self, batch, batch_ix):
-        reals, meta = batch
-        if reals.ndim == 4 and reals.shape[0] == 1:
-            reals = reals[0]
-
-        # prepare conditioning
-        cond = self._conditioning(meta)
-
-        # Optional pretransform encode (e.g., autoencoder latents)
-        diffusion_input = reals
-        if getattr(self.diffusion, "pretransform", None) is not None:
-            pt = self.diffusion.pretransform.to(self.device)
-            pt.eval()
-            with torch.no_grad():
-                # match channels
-                diffusion_input = set_audio_channels(diffusion_input, pt.io_channels)
-                diffusion_input = pt.encode(diffusion_input)
-
-        # K-diffusion (EDM) objective aligned with dpmpp-3m-sde sampling
-        b = diffusion_input.shape[0]
-        device = diffusion_input.device
-        dtype = diffusion_input.dtype
-        # sample log-normal sigmas as in EDM, clamp to [sigma_min, sigma_max]
-        r = torch.randn(b, device=device, dtype=dtype) * self.p_std + self.p_mean
-        sigma = r.exp().clamp(min=self.sigma_min, max=self.sigma_max)
-        noise = torch.randn_like(diffusion_input)
-        # Build conditioning inputs as used by inference
-        cond_inputs = self.diffusion.get_conditioning_inputs(cond)
-        # lazy-create VDenoiser on the underlying DiT wrapper
-        if getattr(self, "_kdenoiser", None) is None:
-            import k_diffusion as K
-            self._kdenoiser = K.external.VDenoiser(self.diffusion.model)
-        # diffusion loss from k-diffusion (mean over batch)
-        diff_loss = self._kdenoiser.loss(
-            diffusion_input, noise, sigma,
-            cfg_dropout_prob=self.cfg_dropout_prob,
-            ttt_module=self.ttt,
-            **cond_inputs,
-        ).mean()
-        # Optional: compute hidden states using the same sigma/noise for inner/outer TTT losses
-        info = {}
-        if self.collect_hidden_states:
-            # rebuild the same noised input consistent with EDM preconditioning
-            alpha = 1.0 / torch.sqrt(1.0 + sigma**2)
-            sigma_v = torch.sqrt(torch.clamp(1.0 - alpha**2, min=0.0))
-            noised = alpha[:, None, None] * diffusion_input + sigma_v[:, None, None] * noise
-            # forward on the DiT wrapper with sigma as t, return_info=True
-            out2, info = self.diffusion.model(
-                noised, sigma,
-                return_info=True,
-                cfg_dropout_prob=self.cfg_dropout_prob,
-                ttt_module=self.ttt,
-                **cond_inputs,
-            )
-
-        # ttt self-supervised loss from hidden states
-        # info["hidden_states"]: list of [B, T, dim]; ensure exists
-        h_list = info.get("hidden_states", []) if self.collect_hidden_states else []
-        ttt_loss = torch.tensor(0.0, device=self.device)
-        proj_outer_loss = torch.tensor(0.0, device=self.device)
-        if len(h_list) > 0:
-            # choose mid layer to form targets; or average all
-            layer_losses = []
-            proj_losses = []
-            for h in h_list:
-                # Inner loss: freeze Theta_* by detaching their outputs
-                with torch.no_grad():
-                    q_i, k_i, v_i = self.ttt_proj(h)
-                # Use K,V only for inner TTT self-supervision
-                ttt_loss_i = self.ttt.self_supervised_forward(k_i, v_i, use_ttt_prime=True)
-                layer_losses.append(ttt_loss_i)
-
-                # Outer loss: train Theta_* while not updating TTT weights
-                # Compute fresh projections with grad
-                q_o, k_o, v_o = self.ttt_proj(h)
-                # Align reversed K to V and encourage Q to align with K/V
-                k_rev = torch.flip(k_o, dims=[1])
-                loss_kv = F.mse_loss(k_rev, v_o)
-                loss_qk = F.mse_loss(q_o, k_o)
-                loss_qv = F.mse_loss(q_o, v_o)
-                proj_losses.append(loss_kv + 0.5 * (loss_qk + loss_qv))
-
-            ttt_loss = torch.stack(layer_losses).mean()
-            proj_outer_loss = torch.stack(proj_losses).mean()
-
-        loss = diff_loss + self.ttt_weight * ttt_loss + self.proj_weight * proj_outer_loss
-
-        # log
-        self.log_dict({
-            "train/loss": loss.detach(),
-            "train/diffusion": diff_loss.detach(),
-            "train/ttt": ttt_loss.detach(),
-            "train/proj": proj_outer_loss.detach(),
-        }, prog_bar=True, on_step=True)
-
-        self.train_hist["step"].append(self.global_step)
-        self.train_hist["loss"].append(loss.item())
-        self.train_hist["diffusion"].append(diff_loss.item())
-        self.train_hist["ttt"].append(ttt_loss.item())
-        if isinstance(proj_outer_loss, torch.Tensor):
-            self.train_hist.setdefault("proj", []).append(proj_outer_loss.item())
-
-        return loss
-
-    def on_train_end(self):
-        # optional plotting
-        try:
-            import matplotlib.pyplot as plt
-            if len(self.train_hist["step"]) == 0:
-                return
-            fig, ax = plt.subplots(figsize=(7, 4))
-            ax.plot(self.train_hist["step"], self.train_hist["loss"], label="loss")
-            ax.plot(self.train_hist["step"], self.train_hist["diffusion"], label="diffusion")
-            ax.plot(self.train_hist["step"], self.train_hist["ttt"], label="ttt")
-            ax.set_xlabel("step")
-            ax.set_ylabel("loss")
-            ax.legend()
-            fig.tight_layout()
-            out_path = os.path.join(self.trainer.default_root_dir or ".", "ttt_training_curves.png")
-            fig.savefig(out_path)
-            print(f"Saved training curves to {out_path}")
-        except Exception as e:
-            print(f"Plotting failed: {e}")
-
-
-def collate_batch(batch: List[Tuple[torch.Tensor, Dict[str, Any]]], target_len: int) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
-    audios = []
-    metas = []
-    for audio, meta in batch:
-        audios.append(_pad_trunc(audio, target_len))
-        metas.append(meta)
-    audio_batch = torch.stack(audios, dim=0)  # [B, 1, T]
-    return audio_batch, metas
+    return torch.stack(batch_audios), batch_metas
 
 
 def load_local_audiox(model_dir: str) -> Tuple[nn.Module, Dict[str, Any]]:
-    """Load model and config from local directory (model/config.json, model/model.*)."""
+    """Load model and config from local directory."""
     import json
     cfg_path = os.path.join(model_dir, "config.json")
     with open(cfg_path, "r") as f:
@@ -311,7 +83,7 @@ def load_local_audiox(model_dir: str) -> Tuple[nn.Module, Dict[str, Any]]:
 
     model = create_model_from_config(model_config)
 
-    # try safetensors then ckpt
+    # Try safetensors then ckpt
     ckpt_path = None
     for name in ["model.safetensors", "model.ckpt"]:
         p = os.path.join(model_dir, name)
@@ -327,23 +99,54 @@ def load_local_audiox(model_dir: str) -> Tuple[nn.Module, Dict[str, Any]]:
 
 
 def main():
+    """Main training script for TTT-enabled diffusion model using Accelerate."""
+    global train_hist, kdenoiser
+    
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_dir", type=str, default="model", help="Local AudioX model dir with config.json and weights")
+    parser.add_argument("--model_dir", type=str, default="model", help="Local AudioX model dir")
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--num_workers", type=int, default=2)
-    parser.add_argument("--max_steps", type=int, default=20, help="For smoke test")
-    parser.add_argument("--devices", type=int, default=1)
-    parser.add_argument("--strategy", type=str, default="auto")
-    parser.add_argument("--use_stub_conditioning", action="store_true", help="Use zero-conditioners to avoid heavy downloads")
-    parser.add_argument("--ttt_weight", type=float, default=0.1)
-    parser.add_argument("--proj_weight", type=float, default=0.05)
-    parser.add_argument("--collect_hidden_states", action="store_true", help="Collect hidden states for TTT loss (uses more memory)")
-    parser.add_argument("--train_last_ttt_layers", type=int, default=None, help="If set, only the last N TTT layers are trainable; earlier ones are frozen")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--max_steps", type=int, default=100, help="Total training steps")
+    parser.add_argument("--log_every", type=int, default=10, help="Log every N steps")
+    parser.add_argument("--save_every", type=int, default=50, help="Save checkpoint every N steps")
+    parser.add_argument("--output_dir", type=str, default="./ttt_checkpoints", help="Output directory")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--mixed_precision", type=str, default="no", choices=["no", "fp16", "bf16"])
+    parser.add_argument("--load_checkpoint", type=str, default=None, help="Path to load checkpoint from")
+    parser.add_argument("--mini_batch_size", type=int, default=3, help="Mini-batch size for TTT")
+    parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate for TTT training")
+    parser.add_argument("--scheduler", type=str, default="constant", choices=["constant", "cosine"])
     args = parser.parse_args()
 
-    # load local dataset prepared in data_loader
+    # Initialize accelerator
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision=args.mixed_precision,
+    )
+    
+    # Set seed for reproducibility
+    set_seed(args.seed)
+    
+    # Set up logging only on main process
+    if accelerator.is_main_process:
+        os.makedirs(args.output_dir, exist_ok=True)
+        print(f"Training TTT with Accelerate")
+        print(f"Mixed precision: {args.mixed_precision}")
+        print(f"Output directory: {args.output_dir}")
+        
+        # Initialize CSV logging
+        csv_path = os.path.join(args.output_dir, "training_log.csv")
+        csv_file = open(csv_path, 'w', newline='')
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(['step', 'loss', 'grad_norm', 'learning_rate'])
+        csv_file.flush()
+    else:
+        csv_file = None
+        csv_writer = None
+
+    # Load dataset
     from data_loader import dataset as hf_dataset
-    # Drop raw 'audio' column to avoid librosa/numba dependency in workers
     for split in list(hf_dataset.keys()):
         try:
             if 'audio' in hf_dataset[split].features:
@@ -351,74 +154,236 @@ def main():
         except Exception:
             pass
 
-    # load local AudioX
-    model, model_cfg = load_local_audiox(args.model_dir)
-
-    sample_rate = model_cfg.get("sample_rate", 44100)
-    sample_size = model_cfg.get("sample_size", int(10 * sample_rate))
+    # Load local AudioX
+    diffusion_model, model_cfg = load_local_audiox(args.model_dir)
+    sample_rate = model_cfg['sample_rate']
 
     # Build dataset/loader
-    train_ds = TTTRecapTrain(hf_dataset["train"], target_sr=sample_rate, seconds=10.0)
+    train_ds = TTT_RecaptionedDataset(hf_dataset["train"], sample_rate=sample_rate)
     dl = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        collate_fn=lambda b: collate_batch(b, target_len=int(10.0 * sample_rate)),
+        collate_fn=collate_batch_ttt,
         pin_memory=True,
     )
 
     # Introspect transformer to construct TTT
-    # ConditionedDiffusionModelWrapper -> DiTWrapper -> DiffusionTransformer -> ContinuousTransformer
-    dit = model.model  # DiTWrapper
-    # underlying DiffusionTransformer
+    dit = diffusion_model.model  # DiTWrapper
     diffusion_transformer = dit.model
     ct = diffusion_transformer.transformer  # ContinuousTransformer
     dim = ct.dim
     depth = ct.depth
 
-    ttt_module = TTT(num_layers=depth, dim=dim)
-    # Use proj_dim == transformer dim so the TTT MLP shapes match during the self-supervised loss
-    ttt_proj = TTTProjections(dim=dim, proj_dim=dim)
-
-    # Optionally freeze early TTT layers to save memory
-    if args.train_last_ttt_layers is not None:
-        k = max(0, depth - args.train_last_ttt_layers)
-        for i, layer in enumerate(ttt_module.layers):
-            req = i >= k
-            for p in layer.parameters():
-                p.requires_grad = req
-
-    lit = TTTCondTrainingWrapper(
-        diffusion_wrapper=model,
-        ttt=ttt_module,
-        ttt_proj=ttt_proj,
-        sample_rate=sample_rate,
-        lr=5e-5,
-        ttt_weight=args.ttt_weight,
-        use_stub_conditioning=args.use_stub_conditioning,
-        cond_dim=model_cfg["model"]["conditioning"]["cond_dim"],
-        collect_hidden_states=args.collect_hidden_states,
-        proj_weight=args.proj_weight,
+    # Define projection dimension
+    proj_dim = dim // 4
+    
+    # Create TTT module
+    ttt_module = TTT(
+        num_layers=depth,
+        model_dim=dim,
+        proj_dim=proj_dim,
+        mini_batch_size=args.mini_batch_size,
+        num_heads=model_cfg["model"]["diffusion"]["config"]["num_heads"]
     )
 
-    # Two-GPU ready training; for smoke test limit steps
-    # Optional: use faster matmul precision on Tensor Cores
+    if args.load_checkpoint is not None:
+        checkpoint = torch.load(args.load_checkpoint, map_location="cpu")
+        if 'ttt_state_dict' in checkpoint:
+            # Loading from full checkpoint
+            state_dict = checkpoint['ttt_state_dict']
+        else:
+            # Loading just TTT weights
+            state_dict = checkpoint
+        
+        ttt_module.load_state_dict(state_dict)
+        print(f"Loaded TTT checkpoint from {args.load_checkpoint}")
+
+    if accelerator.is_main_process:
+        print(f"Created TTT with {depth} layers, dim={dim}, proj_dim={proj_dim}")
+        total_params = sum(p.numel() for p in ttt_module.parameters())
+        trainable_params = sum(p.numel() for p in ttt_module.parameters() if p.requires_grad)
+        print(f"TTT total parameters: {total_params}")
+        print(f"TTT trainable parameters: {trainable_params}")
+
+    # Freeze diffusion model, train TTT
+    diffusion_model.requires_grad_(False)
+    diffusion_model.eval()
+    ttt_module.requires_grad_(True)
+    ttt_module.train()
+
+    # Create optimizer and scheduler inline
+    optimizer = torch.optim.AdamW(
+        ttt_module.parameters(), 
+        lr=args.learning_rate, 
+        betas=(0.9, 0.999), 
+        weight_decay=1e-4
+    )
+    
+    match args.scheduler:
+        case "constant":
+            scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0, total_iters=args.max_steps)
+        case "cosine":
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.max_steps, eta_min=1e-6)
+
+    # Prepare everything with accelerator
+    diffusion_model, ttt_module, optimizer, dl, scheduler = accelerator.prepare(
+        diffusion_model, ttt_module, optimizer, dl, scheduler
+    )
+    
+    # Optional: faster matmul on Tensor Cores
     try:
         torch.set_float32_matmul_precision("high")
-    except Exception:
+    except:
         pass
 
-    trainer = pl.Trainer(
-        accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        devices=args.devices,
-        strategy=args.strategy,
-        max_steps=args.max_steps,
-        gradient_clip_val=0.1,
-        log_every_n_steps=1,
-    )
+    # Setup K-diffusion wrapper once
+    from k_diffusion.external import VDenoiser
+    kdenoiser = VDenoiser(diffusion_model.model)
 
-    trainer.fit(lit, train_dataloaders=dl)
+    # Training loop
+    global_step = 0
+    
+    if accelerator.is_main_process:
+        print(f"Starting training for {args.max_steps} steps...")
+        
+    while global_step < args.max_steps:
+        for batch in dl:
+            with accelerator.accumulate(diffusion_model):
+                # Training step inline
+                reals, meta = batch
+                
+                # Prepare conditioning
+                cond = diffusion_model.conditioner(meta, accelerator.device)
+                
+                # Optional pretransform encode
+                diffusion_input = reals
+                if getattr(diffusion_model, "pretransform", None) is not None:
+                    pt = diffusion_model.pretransform.to(accelerator.device)
+                    pt.eval()
+                    with torch.no_grad():
+                        diffusion_input = set_audio_channels(diffusion_input, pt.io_channels)
+                        diffusion_input = pt.encode(diffusion_input)
+
+                # K-diffusion (EDM) objective
+                b = diffusion_input.shape[0]
+                dtype = diffusion_input.dtype
+                
+                # Sample log-normal sigmas
+                r = torch.randn(b, device=accelerator.device, dtype=dtype) * p_std + p_mean
+                sigma = r.exp().clamp(min=sigma_min, max=sigma_max)
+                noise = torch.randn_like(diffusion_input)
+                
+                # Build conditioning inputs
+                cond_inputs = diffusion_model.get_conditioning_inputs(cond)
+                
+                # Diffusion loss from k-diffusion
+                loss = kdenoiser.loss(
+                    diffusion_input, noise, sigma,
+                    cfg_dropout_prob=cfg_dropout_prob,
+                    ttt_module=ttt_module,
+                    **cond_inputs,
+                ).mean()
+                
+                # Backward pass
+                accelerator.backward(loss)
+                
+                # Calculate gradient norm inline
+                total_norm = 0.0
+                param_count = 0
+                for name, param in ttt_module.named_parameters():
+                    if param.grad is not None:
+                        param_norm = param.grad.detach().data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                        param_count += 1
+                
+                if param_count > 0 and total_norm > 0:
+                    grad_norm = total_norm ** 0.5
+                else:
+                    grad_norm = 0.0
+                    print('Warning: No gradients found')
+
+                # Optimizer step
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                
+                # Update training history
+                train_hist["step"].append(global_step)
+                train_hist["loss"].append(loss.item())
+                
+                # Logging
+                if accelerator.is_main_process and (global_step % args.log_every == 0 or global_step == 0):
+                    current_lr = scheduler.get_last_lr()[0]
+                    print(f"Step {global_step}/{args.max_steps} | Loss: {loss.item():.6f} | Grad Norm: {grad_norm:.6f} | LR: {current_lr:.2e}")
+                    
+                    # Log to CSV
+                    if csv_writer is not None:
+                        csv_writer.writerow([global_step, loss.item(), grad_norm, current_lr])
+                        csv_file.flush()
+                
+                # Save checkpoint inline
+                if accelerator.is_main_process and global_step > 0 and global_step % args.save_every == 0:
+                    try:
+                        model_path = os.path.join(args.output_dir, f"step_{global_step}.pt")
+                        torch.save({
+                            'step': global_step,
+                            'diffusion_state_dict': accelerator.unwrap_model(diffusion_model).state_dict(),
+                            'ttt_state_dict': accelerator.unwrap_model(ttt_module).state_dict(),
+                            'optimizer_state_dict': optimizer.state_dict(),
+                            'scheduler_state_dict': scheduler.state_dict(),
+                            'train_hist': train_hist,
+                        }, model_path)
+                        
+                        ttt_path = os.path.join(args.output_dir, f"ttt_module_step_{global_step}.pt")
+                        torch.save(accelerator.unwrap_model(ttt_module).state_dict(), ttt_path)
+                        
+                        print(f"Saved step {global_step} checkpoint: {model_path}")
+                        print(f"Saved step {global_step} TTT weights: {ttt_path}")
+                        
+                    except Exception as e:
+                        print(f"Failed to save step {global_step} checkpoint: {e}")
+                
+                global_step += 1
+                if global_step >= args.max_steps:
+                    break
+    
+    # Final save inline
+    if accelerator.is_main_process:
+        print("Training completed!")
+        
+        # Close CSV file
+        if csv_file is not None:
+            csv_file.close()
+            print(f"Saved training log to {csv_path}")
+        
+        try:
+            ttt_path = os.path.join(args.output_dir, "ttt_module.pt")
+            torch.save(accelerator.unwrap_model(ttt_module).state_dict(), ttt_path)
+            print(f"Saved final TTT weights to {ttt_path}")
+            
+            # Save training curves
+            if len(train_hist["step"]) > 0:
+                try:
+                    import matplotlib.pyplot as plt
+                    fig, ax = plt.subplots(figsize=(7, 4))
+                    ax.plot(train_hist["step"], train_hist["loss"], label="loss")
+                    ax.set_xlabel("step")
+                    ax.set_ylabel("loss")
+                    ax.legend()
+                    fig.tight_layout()
+                    out_path = os.path.join(args.output_dir, "ttt_training_curves.png")
+                    fig.savefig(out_path)
+                    print(f"Saved training curves to {out_path}")
+                except Exception as e:
+                    print(f"Plotting failed: {e}")
+                    
+        except Exception as e:
+            print(f"Saving final weights failed: {e}")
+
+    # Clean up
+    accelerator.end_training()
 
 
 if __name__ == "__main__":

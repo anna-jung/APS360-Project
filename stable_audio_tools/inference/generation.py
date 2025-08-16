@@ -106,6 +106,9 @@ def generate_diffusion_cond(
         init_noise_level: float = 1.0,
         mask_args: dict = None,
         return_latents = False,
+    # TTT integration
+    ttt_module = None,
+    ttt_projections = None,
         **sampler_kwargs
         ) -> torch.Tensor: 
     """
@@ -226,7 +229,23 @@ def generate_diffusion_cond(
     if diff_objective == "v":    
         # k-diffusion denoising process go!
         # breakpoint()
-        sampled = sample_k(model.model, noise, init_audio, mask, steps, **sampler_kwargs, **conditioning_inputs, **negative_conditioning_tensors, cfg_scale=cfg_scale, batch_cfg=True, rescale_cfg=True, device=device)
+        sampled = sample_k(
+            model.model,
+            noise,
+            init_audio,
+            mask,
+            steps,
+            **sampler_kwargs,
+            **conditioning_inputs,
+            **negative_conditioning_tensors,
+            cfg_scale=cfg_scale,
+            batch_cfg=True,
+            rescale_cfg=True,
+            device=device,
+            # pass through TTT modules
+            ttt_module=ttt_module,
+            ttt_projections=ttt_projections,
+        )
 
     elif diff_objective == "rectified_flow":
 
@@ -236,7 +255,22 @@ def generate_diffusion_cond(
         if "sampler_type" in sampler_kwargs:
             del sampler_kwargs["sampler_type"]
 
-        sampled = sample_rf(model.model, noise, init_data=init_audio, steps=steps, **sampler_kwargs, **conditioning_inputs, **negative_conditioning_tensors, cfg_scale=cfg_scale, batch_cfg=True, rescale_cfg=True, device=device)
+        sampled = sample_rf(
+            model.model,
+            noise,
+            init_data=init_audio,
+            steps=steps,
+            **sampler_kwargs,
+            **conditioning_inputs,
+            **negative_conditioning_tensors,
+            cfg_scale=cfg_scale,
+            batch_cfg=True,
+            rescale_cfg=True,
+            device=device,
+            # pass through TTT modules
+            ttt_module=ttt_module,
+            ttt_projections=ttt_projections,
+        )
 
     # v-diffusion: 
     del noise

@@ -182,3 +182,9 @@ LSTMBaseline.py
 /lightning_logs
 
 *.wav
+
+/.vscode
+/gen_1
+/gen_2
+/non_ttt_finetune
+/ttt_finetune
